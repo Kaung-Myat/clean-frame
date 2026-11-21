@@ -10,6 +10,7 @@ import 'package:archive/archive_io.dart';
 import 'package:args/args.dart';
 import 'package:path/path.dart' as p;
 
+import 'package:clean_frame/src/cli_version.dart';
 import 'package:clean_frame/src/downloader.dart';
 import 'package:clean_frame/src/post_setup.dart';
 import 'package:clean_frame/src/replacer.dart';
@@ -20,10 +21,23 @@ ArgParser _buildParser() {
     ..addOption('name', abbr: 'n', help: 'App name (snake_case).')
     ..addOption('org',
         abbr: 'o', defaultsTo: 'com.example', help: 'Organisation prefix.')
-    ..addOption('version',
-        abbr: 'v', help: 'Template branch to pull (default: latest).')
-    ..addFlag('list',
-        abbr: 'l', negatable: false, help: 'List available template versions.')
+    ..addOption(
+      'version',
+      abbr: 'v',
+      help: 'Template branch to pull, named vX.Y.Z (default: highest). '
+          'Not a GitHub Release tag.',
+    )
+    ..addFlag(
+      'list',
+      abbr: 'l',
+      negatable: false,
+      help: 'List template version branches (vX.Y.Z).',
+    )
+    ..addFlag(
+      'cli-version',
+      negatable: false,
+      help: 'Print the clean_frame CLI version.',
+    )
     ..addFlag('help', abbr: 'h', negatable: false, help: 'Print usage.');
 }
 
@@ -53,6 +67,11 @@ Future<void> main(List<String> arguments) async {
     return;
   }
 
+  if (args.flag('cli-version')) {
+    stdout.writeln(cliVersion);
+    return;
+  }
+
   if (args.flag('list')) {
     try {
       await listBranches();
@@ -78,10 +97,26 @@ Future<void> main(List<String> arguments) async {
 
   final org = args.option('org') ?? 'com.example';
 
-  // Resolve the template version.
-  String version;
+  // Resolve the template version and reject names that are not releases.
+  final List<String> releases;
   try {
-    version = args.option('version') ?? await resolveLatestBranch();
+    releases = releaseBranches(await fetchBranches());
+  } catch (e) {
+    stderr.writeln('Error: $e');
+    exit(1);
+  }
+
+  final requested = args.option('version');
+  if (requested != null && !releases.contains(requested)) {
+    stderr.writeln(
+      'Error: ${unknownTemplateVersionMessage(requested, releases)}',
+    );
+    exit(1);
+  }
+
+  final String version;
+  try {
+    version = requested ?? latestVersionBranch(releases);
   } catch (e) {
     stderr.writeln('Error: $e');
     exit(1);
@@ -95,33 +130,51 @@ Future<void> main(List<String> arguments) async {
     exit(1);
   }
 
-  File? zipFile;
+  late final File zipFile;
+  var zipDownloaded = false;
   try {
     stdout.writeln('→ Downloading template $version...');
     zipFile = await downloadTemplate(version);
+    zipDownloaded = true;
 
     stdout.writeln('→ Extracting...');
-    final projectDir = await _extractTemplate(zipFile, targetDir);
+    await _extractTemplate(zipFile, targetDir);
 
     stdout.writeln('→ Renaming project to $name...');
-    await replaceInProject(projectDir, name, org);
-
-    await cleanupZip(zipFile);
-
-    stdout.writeln('→ Initialising git...');
-    await gitInit(projectDir);
-
-    stdout.writeln('→ Running flutter pub get...');
-    await flutterPubGet(projectDir);
-
-    printSuccess(name, org);
+    await replaceInProject(targetDir, name, org);
   } catch (e) {
     stderr.writeln('Error: $e');
-    if (zipFile != null) {
+    if (zipDownloaded) {
       await cleanupZip(zipFile);
+    }
+    if (targetDir.existsSync()) {
+      stderr.writeln('Removing incomplete directory "./$name/".');
+      await deleteIncompleteProject(targetDir);
     }
     exit(1);
   }
+
+  // Temp zip cleanup must not delete a finished project on failure.
+  try {
+    await cleanupZip(zipFile);
+  } catch (e) {
+    stderr.writeln('Warning: could not delete temp zip: $e');
+  }
+
+  stdout.writeln('→ Initialising git...');
+  final gitOk = await gitInit(targetDir);
+
+  stdout.writeln('→ Running flutter pub get...');
+  final pubOk = await flutterPubGet(targetDir);
+
+  if (!gitOk || !pubOk) {
+    stderr.writeln(
+      'Error: project files are in "./$name/" but setup did not finish.',
+    );
+    exit(1);
+  }
+
+  printSuccess(name, org);
 }
 
 /// Extracts [zipFile] and moves the single top-level folder to [targetDir].
@@ -138,6 +191,21 @@ Future<Directory> _extractTemplate(File zipFile, Directory targetDir) async {
     '${DateTime.now().millisecondsSinceEpoch}',
   )..createSync(recursive: true);
 
+  try {
+    return await _extractInto(archive, staging, targetDir);
+  } catch (_) {
+    if (staging.existsSync()) {
+      staging.deleteSync(recursive: true);
+    }
+    rethrow;
+  }
+}
+
+Future<Directory> _extractInto(
+  Archive archive,
+  Directory staging,
+  Directory targetDir,
+) async {
   for (final entry in archive) {
     final outPath = '${staging.path}/${entry.name}';
     if (entry.isFile) {

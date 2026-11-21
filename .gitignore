@@ -1,0 +1,13 @@
+# https://dart.dev/guides/libraries/private-files
+.dart_tool/
+.packages
+build/
+doc/api/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# OS
+.DS_Store
